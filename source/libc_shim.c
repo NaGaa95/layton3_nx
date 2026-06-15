@@ -28,6 +28,7 @@
 #include "util.h"
 #include "so_util.h"
 #include "libc_shim.h"
+#include "data0.h"
 
 // ---------------------------------------------------------------------------
 // fortify (_chk) wrappers: ignore the object-size argument
@@ -291,8 +292,10 @@ int fseek_fake(FILE *f, long off, int whence) {
 // ---------------------------------------------------------------------------
 
 typedef struct {
-  FILE *f;
+  FILE *f;        // NULL => served from the data0 pack (base/cursor used)
   long size;
+  int64_t base;
+  int64_t cursor;
 } Asset;
 
 void *AAssetManager_fromJava_fake(void *env, void *mgr) {
@@ -318,30 +321,43 @@ const char *asset_path(const char *rel) {
 void *AAssetManager_open_fake(void *mgr, const char *path, int mode) {
   (void)mgr; (void)mode;
   FILE *f = fopen(asset_path(path), "rb");
-  debugPrintf("AAsset: open(%s) -> %s\n", path, f ? "ok" : "MISSING");
-  if (!f)
-    return NULL;
-  // fewer fsdev round trips for the parsers that read in small chunks
-  setvbuf(f, NULL, _IOFBF, 16 * 1024);
-  Asset *a = malloc(sizeof(*a));
-  a->f = f;
-  fseek(f, 0, SEEK_END);
-  a->size = ftell(f);
-  fseek(f, 0, SEEK_SET);
-  return a;
+  if (f) {
+    // fewer fsdev round trips for the parsers that read in small chunks
+    setvbuf(f, NULL, _IOFBF, 16 * 1024);
+    Asset *a = malloc(sizeof(*a));
+    a->f = f;
+    a->base = 0;
+    a->cursor = 0;
+    fseek(f, 0, SEEK_END);
+    a->size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    return a;
+  }
+  // not loose: serve from the bundled asset pack
+  int64_t off, sz;
+  if (data0_locate(path, &off, &sz)) {
+    Asset *a = malloc(sizeof(*a));
+    a->f = NULL;
+    a->base = off;
+    a->cursor = 0;
+    a->size = (long)sz;
+    return a;
+  }
+  debugPrintf("AAsset: open(%s) -> MISSING\n", path);
+  return NULL;
 }
 
-// returns a real fd onto the asset's file (the engine reads a sub-region
-// itself); outStart/outLength describe the whole file
+// returns an fd plus the data's sub-region (outStart/outLength); the engine
+// fdopen()s it and seeks to outStart itself
 int AAsset_openFileDescriptor64_fake(void *asset, int64_t *outStart, int64_t *outLength) {
   Asset *a = asset;
   if (!a)
     return -1;
-  const int fd = dup(fileno(a->f));
+  const int fd = a->f ? dup(fileno(a->f)) : data0_dup_fd();
   if (fd < 0)
     return -1;
   if (outStart)
-    *outStart = 0;
+    *outStart = a->base;
   if (outLength)
     *outLength = a->size;
   return fd;
@@ -350,21 +366,49 @@ int AAsset_openFileDescriptor64_fake(void *asset, int64_t *outStart, int64_t *ou
 void AAsset_close_fake(void *asset) {
   Asset *a = asset;
   if (a) {
-    fclose(a->f);
+    if (a->f)
+      fclose(a->f);
     free(a);
   }
 }
 
 int AAsset_read_fake(void *asset, void *buf, size_t count) {
   Asset *a = asset;
-  return a ? (int)fread(buf, 1, count, a->f) : -1;
+  if (!a)
+    return -1;
+  if (a->f)
+    return (int)fread(buf, 1, count, a->f);
+  // data0-backed
+  long remain = a->size - a->cursor;
+  if (remain <= 0)
+    return 0;
+  if ((long)count > remain)
+    count = (size_t)remain;
+  const int got = data0_pread(buf, a->base + a->cursor, (int)count);
+  if (got > 0)
+    a->cursor += got;
+  return got;
 }
 
 long AAsset_seek_fake(void *asset, long off, int whence) {
   Asset *a = asset;
-  if (!a || fseek(a->f, off, whence) < 0)
+  if (!a)
     return -1;
-  return ftell(a->f);
+  if (a->f) {
+    if (fseek(a->f, off, whence) < 0)
+      return -1;
+    return ftell(a->f);
+  }
+  // data0-backed
+  long np;
+  if (whence == SEEK_SET)      np = off;
+  else if (whence == SEEK_CUR) np = (long)a->cursor + off;
+  else if (whence == SEEK_END) np = a->size + off;
+  else                         return -1;
+  if (np < 0) np = 0;
+  if (np > a->size) np = a->size;
+  a->cursor = np;
+  return np;
 }
 
 long AAsset_getLength_fake(void *asset) {

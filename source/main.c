@@ -32,6 +32,7 @@
 #include "jni.h"
 #include "opensl.h"
 #include "movie.h"
+#include "data0.h"
 
 static void *heap_so_base = NULL;
 static size_t heap_so_limit = 0;
@@ -161,18 +162,26 @@ static int egl_init(void) {
 
 static uint8_t FS_LoadFile(char *buf, const char *fname, int pos, int size) {
   FILE *f = fopen(asset_path(fname), "rb");
-  if (!f)
-    return 0;
-  fseek(f, pos, SEEK_SET);
-  fread(buf, 1, size, f);
-  fclose(f);
-  return 1;
+  if (f) {
+    fseek(f, pos, SEEK_SET);
+    fread(buf, 1, size, f);
+    fclose(f);
+    return 1;
+  }
+  // not loose: serve from the bundled asset pack
+  int64_t off, sz;
+  if (data0_locate(fname, &off, &sz))
+    return data0_pread(buf, off + pos, size) >= 0;
+  return 0;
 }
 
 static int FS_GetLength(const char *fname) {
   struct stat st;
   if (stat(asset_path(fname), &st) >= 0)
     return (int)st.st_size;
+  int64_t off, sz;
+  if (data0_locate(fname, &off, &sz))
+    return (int)sz;
   return 0;
 }
 
@@ -505,6 +514,10 @@ int main(int argc, char *argv[]) {
 
   check_syscalls();
   check_data();
+
+  // mount the bundled asset pack (the puzzle UI and other nazo graphics live
+  // only here); a missing pack just falls back to loose files
+  data0_mount(asset_path("data0"));
 
   set_screen_size(config.screen_width, config.screen_height);
 
