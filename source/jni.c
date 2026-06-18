@@ -177,7 +177,9 @@ static FakeID *get_id(const char *name, const char *sig) {
 static char ime_text[512] = "";
 static int ime_editing = 0;
 
-static void ime_start(const char *initial, int max_len) {
+#define IME_TEXT_MAX ((int)sizeof(ime_text) - 1)
+
+static void ime_start(const char *initial, int edit_type) {
   SwkbdConfig kbd;
   if (R_FAILED(swkbdCreate(&kbd, 0))) {
     ime_text[0] = 0;
@@ -185,10 +187,11 @@ static void ime_start(const char *initial, int max_len) {
     return;
   }
   swkbdConfigMakePresetDefault(&kbd);
+  if (edit_type != 0)
+    swkbdConfigSetType(&kbd, SwkbdType_NumPad);
   if (initial && initial[0])
     swkbdConfigSetInitialText(&kbd, initial);
-  if (max_len > 0 && max_len < (int)sizeof(ime_text))
-    swkbdConfigSetStringLenMax(&kbd, max_len);
+  swkbdConfigSetStringLenMax(&kbd, IME_TEXT_MAX);
   // blocks on the system applet; the game polls UI_GetEditState afterwards
   ime_editing = 1;
   if (R_FAILED(swkbdShow(&kbd, ime_text, sizeof(ime_text))))
@@ -333,8 +336,8 @@ static void call_void(FakeID *id, va_list va) {
   }
   if (!strcmp(name, "UI_StartEditText")) {
     const char *initial = obj_str(va_arg(va, void *));
-    const int max_len = va_arg(va, int);
-    ime_start(initial, max_len);
+    const int edit_type = va_arg(va, int);
+    ime_start(initial, edit_type);
     return;
   }
   if (!strcmp(name, "MO_PauseMovie")) {
