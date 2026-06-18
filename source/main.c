@@ -481,9 +481,6 @@ static void collect_input(int *touch_num, float *x1, float *y1, float *x2, float
   if (config.portrait == 1) {
     dx = ny;
     dy = nx;
-  } else if (config.portrait == 2) {
-    dx = -ny;
-    dy = -nx;
   } else {
     dx = nx;
     dy = -ny;
