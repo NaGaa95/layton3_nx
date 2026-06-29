@@ -427,7 +427,8 @@ static void rot_blit(void) {
   glDisableVertexAttribArray(rot.loc_uv);
 }
 
-static float cursor_x, cursor_y; // hidden stick-driven touch point (view space)
+static float cursor_x, cursor_y; // stick-driven touch point (view space)
+static int   cursor_shown;       // draw the pointer this frame? (stick in use, not touching)
 
 // ---------------------------------------------------------------------------
 // input: touchscreen in handheld, a stick-driven cursor with a controller.
@@ -463,6 +464,7 @@ static void collect_input(int *touch_num, float *x1, float *y1, float *x2, float
     panel_to_view(ts.touches[0].x, ts.touches[0].y, x1, y1);
     if (*touch_num > 1)
       panel_to_view(ts.touches[1].x, ts.touches[1].y, x2, y2);
+    cursor_shown = 0; // direct touch: no on-screen pointer needed
     return;
   }
 
@@ -475,6 +477,12 @@ static void collect_input(int *touch_num, float *x1, float *y1, float *x2, float
   float nx = ls.x / 32767.0f, ny = ls.y / 32767.0f;
   if (nx > -dead && nx < dead) nx = 0.0f;
   if (ny > -dead && ny < dead) ny = 0.0f;
+
+  // show the pointer once the controller is actually being used; a real touch
+  // (handled above) hides it again
+  if (nx != 0.0f || ny != 0.0f ||
+      (held & (HidNpadButton_ZR | HidNpadButton_R | HidNpadButton_A)))
+    cursor_shown = 1;
 
   // rotate the stick into view space so "up" follows the held console
   float dx, dy;
@@ -497,6 +505,101 @@ static void collect_input(int *touch_num, float *x1, float *y1, float *x2, float
     *x1 = cursor_x;
     *y1 = cursor_y;
   }
+}
+
+// On-screen pointer for the stick-driven cursor. Drawn in view space straight
+// after the game's frame, into the same target the game used (the portrait FBO
+// or the framebuffer), so it sits exactly on the touch point collect_input
+// feeds the engine -- and is rotated together with the game in portrait. The
+// shape is a radially symmetric dot, so it reads correctly at any rotation.
+static struct {
+  GLuint prog;
+  GLint loc_pos, loc_local, loc_feather;
+  int ready;
+} cur;
+
+static void cursor_draw(void) {
+  if (!cur.ready) {
+    cur.ready = 1;
+    cur.prog = link_program(
+        "attribute vec2 aPos; attribute vec2 aLocal; varying vec2 vLocal;"
+        "void main() { vLocal = aLocal; gl_Position = vec4(aPos, 0.0, 1.0); }",
+        "precision mediump float; varying vec2 vLocal; uniform float uFeather;"
+        "void main() {"
+        "  float d = length(vLocal);"
+        "  float a = 1.0 - smoothstep(1.0 - uFeather, 1.0, d);"
+        "  float core = 1.0 - smoothstep(0.74 - uFeather, 0.74 + uFeather, d);"
+        "  vec3 col = mix(vec3(0.04), vec3(0.98), core);" // dark ring, white centre
+        "  gl_FragColor = vec4(col, a * 0.85);"
+        "}");
+    if (cur.prog) {
+      cur.loc_pos = glGetAttribLocation(cur.prog, "aPos");
+      cur.loc_local = glGetAttribLocation(cur.prog, "aLocal");
+      cur.loc_feather = glGetUniformLocation(cur.prog, "uFeather");
+    }
+  }
+  if (!cur.prog)
+    return;
+
+  // a constant on-screen size regardless of render resolution
+  const float r = 18.0f * ((float)(view_w > view_h ? view_w : view_h) / 1280.0f);
+  const float cx = (cursor_x / (float)view_w) * 2.0f - 1.0f;
+  const float cy = 1.0f - (cursor_y / (float)view_h) * 2.0f; // view y is top-down
+  const float rx = r / (float)view_w * 2.0f;
+  const float ry = r / (float)view_h * 2.0f;
+  const GLfloat pos[8] = {
+    cx - rx, cy - ry,  cx + rx, cy - ry,  cx - rx, cy + ry,  cx + rx, cy + ry,
+  };
+  static const GLfloat local[8] = { -1,-1,  1,-1,  -1,1,  1,1 };
+
+  // save the engine state this draw touches
+  GLint prev_prog, prev_buf, prev_vp[4];
+  GLint en_pos = 0, en_local = 0;
+  GLint bsrc_rgb, bdst_rgb, bsrc_a, bdst_a, beq_rgb, beq_a;
+  const GLboolean p_blend = glIsEnabled(GL_BLEND);
+  const GLboolean p_depth = glIsEnabled(GL_DEPTH_TEST);
+  const GLboolean p_scissor = glIsEnabled(GL_SCISSOR_TEST);
+  const GLboolean p_cull = glIsEnabled(GL_CULL_FACE);
+  glGetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+  glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &prev_buf);
+  glGetIntegerv(GL_VIEWPORT, prev_vp);
+  glGetIntegerv(GL_BLEND_SRC_RGB, &bsrc_rgb);
+  glGetIntegerv(GL_BLEND_DST_RGB, &bdst_rgb);
+  glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsrc_a);
+  glGetIntegerv(GL_BLEND_DST_ALPHA, &bdst_a);
+  glGetIntegerv(GL_BLEND_EQUATION_RGB, &beq_rgb);
+  glGetIntegerv(GL_BLEND_EQUATION_ALPHA, &beq_a);
+  glGetVertexAttribiv(cur.loc_pos, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en_pos);
+  glGetVertexAttribiv(cur.loc_local, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &en_local);
+
+  glViewport(0, 0, view_w, view_h);
+  glDisable(GL_DEPTH_TEST);
+  glDisable(GL_SCISSOR_TEST);
+  glDisable(GL_CULL_FACE);
+  glEnable(GL_BLEND);
+  glBlendEquation(GL_FUNC_ADD);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glUseProgram(cur.prog);
+  glUniform1f(cur.loc_feather, 2.5f / r);
+  glEnableVertexAttribArray(cur.loc_pos);
+  glEnableVertexAttribArray(cur.loc_local);
+  glVertexAttribPointer(cur.loc_pos, 2, GL_FLOAT, GL_FALSE, 0, pos);
+  glVertexAttribPointer(cur.loc_local, 2, GL_FLOAT, GL_FALSE, 0, local);
+  glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+
+  // restore exactly what we changed
+  if (!en_pos) glDisableVertexAttribArray(cur.loc_pos);
+  if (!en_local) glDisableVertexAttribArray(cur.loc_local);
+  glBindBuffer(GL_ARRAY_BUFFER, (GLuint)prev_buf);
+  glUseProgram(prev_prog);
+  glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+  glBlendEquationSeparate(beq_rgb, beq_a);
+  glBlendFuncSeparate(bsrc_rgb, bdst_rgb, bsrc_a, bdst_a);
+  if (!p_blend) glDisable(GL_BLEND);
+  if (p_depth) glEnable(GL_DEPTH_TEST);
+  if (p_scissor) glEnable(GL_SCISSOR_TEST);
+  if (p_cull) glEnable(GL_CULL_FACE);
 }
 
 int main(int argc, char *argv[]) {
@@ -607,6 +710,13 @@ int main(int argc, char *argv[]) {
     if (frame_step < 1) frame_step = 1;
     if (frame_step > 6) frame_step = 6;
     game_render(fake_env, NULL, frame_step, 0, touch_num, x1, y1, x2, y2);
+
+    // overlay the stick pointer into the same view-space target the game drew
+    // to, so it lands on the touch point (and rotates with it in portrait)
+    if (cursor_shown) {
+      glBindFramebuffer(GL_FRAMEBUFFER, config.portrait ? rot.fbo : 0);
+      cursor_draw();
+    }
 
     if (config.portrait)
       rot_blit();
