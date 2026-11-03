@@ -36,6 +36,9 @@ ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=$(DEVKITPRO)/libnx/switch.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
 # ffmpeg (cutscene video) + mesa GLES2/EGL + libnx
+# Publish all EGL presentation paths, including guest import tables.
+LDFLAGS += -Wl,--wrap=eglSwapBuffers,--wrap=eglGetProcAddress,--wrap=__libnx_exit
+
 LIBS	:= -lavformat -lavcodec -lswscale -lswresample -lavutil -ldav1d -lz -lbz2 \
 			-lEGL -lGLESv2 -lglapi -ldrm_nouveau -lnx -lm
 
